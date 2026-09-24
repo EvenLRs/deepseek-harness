@@ -135,7 +135,11 @@ jobs:
 
       # Packaging reads release settings from this Git-ignored file and never
       # from ambient values; unsigned builds need the app id and the selected
-      # mandatory-update origin only.
+      # mandatory-update origin only. Test deployment additionally forces a
+      # nonempty allowedAuthOrigins login whitelist in the mandatory-update
+      # config; the placeholder matches the repo's own .env.windows.example
+      # and test-windows-installer default (replace it to exercise the real
+      # Feishu test login inside the built installer).
       - name: Write the unsigned packaging settings
         shell: pwsh
         run: |
@@ -144,6 +148,7 @@ jobs:
             'DSH_DESKTOP_AUTO_UPDATE_ENV=test'
             'DSH_DESKTOP_MANDATORY_UPDATE_TEST_ORIGIN=https://harness-test.deepseek.com'
             'DSH_DESKTOP_MANDATORY_UPDATE_PROD_ORIGIN=https://harness.deepseek.com'
+            "DSH_DESKTOP_MANDATORY_UPDATE_CONFIG='{""allowedAuthOrigins"":[""https://login.example.com""]}'"
           )
 
       # package-target.ts links its whole static import graph before main()
