@@ -146,6 +146,17 @@ jobs:
             'DSH_DESKTOP_MANDATORY_UPDATE_PROD_ORIGIN=https://harness.deepseek.com'
           )
 
+      # package-target.ts links its whole static import graph before main()
+      # runs, and macos-notarization-proxy.ts imports
+      # @deepseek-ai/node-addon-system/flock, whose lib/ is tsc output that
+      # is not committed and that pnpm install never generates. The package
+      # command's internal build:official would emit it, but only after
+      # module link — so a clean checkout must build the entry package first.
+      # The package command runs this same build later for the Landlock pack.
+      - name: Build the native system entry package
+        shell: pwsh
+        run: pnpm --dir native/system run build:ts
+
       # The package command runs the repository build itself: official build,
       # packed dsh/vendor/landlock closures, prepared Electron and primary
       # runtime, then the unsigned NSIS installer.
