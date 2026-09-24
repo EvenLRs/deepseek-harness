@@ -1,0 +1,211 @@
+# Keep this fork aligned with upstream and prove the desktop client still compiles
+# from synchronized sources. GitHub has no cross-repository push trigger and
+# upstream sends no repository_dispatch, so the sync polls on a schedule;
+# workflow_dispatch allows manual runs. Scheduled workflows pause after 60 days
+# without repository activity. A GITHUB_TOKEN push starts no other workflow, so
+# this run owns the follow-up build instead of waiting for a push event. The
+# build job also publishes the installer as a prerelease; release assets carry
+# no expiration, which is the permanent home the Actions artifact cannot be.
+name: Sync upstream and build desktop
+
+on:
+  schedule:
+    - cron: '42 * * * *'
+  workflow_dispatch:
+
+# One pipeline at a time: a queued run replaces an older pending run, and an
+# in-flight sync or packaging run is never cancelled halfway through a push or
+# artifact write.
+concurrency:
+  group: sync-upstream-build
+  cancel-in-progress: false
+
+env:
+  PRIMARY_NODE_VERSION: '24'
+  # CI runs must never report to the production telemetry endpoint baked
+  # into apps/cli/cordis.yml (AppCLIEntry disables the row when set).
+  DSH_TELEMETRY_DISABLED: '1'
+  UPSTREAM_REPOSITORY: deepseek-ai/deepseek-harness
+  # Separate from UPSTREAM_REPOSITORY so the fetch URL stays overridable.
+  UPSTREAM_URL: https://github.com/deepseek-ai/deepseek-harness.git
+
+jobs:
+  sync:
+    name: sync from upstream
+    runs-on: windows-2025
+    timeout-minutes: 30
+    permissions:
+      contents: write
+    outputs:
+      changed: ${{ steps.sync.outputs.changed }}
+      sha: ${{ steps.sync.outputs.sha }}
+    steps:
+      # Fork-only contract: refuse any repository that is not a fork of the
+      # upstream before touching its default branch.
+      - name: Verify this repository is a fork of upstream
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $repository = gh api "repos/$env:GITHUB_REPOSITORY" | ConvertFrom-Json
+          if (-not $repository.fork) {
+            throw "$env:GITHUB_REPOSITORY is not a fork; this workflow only syncs forks of $env:UPSTREAM_REPOSITORY"
+          }
+          if ($repository.source.full_name -ne $env:UPSTREAM_REPOSITORY) {
+            throw "$env:GITHUB_REPOSITORY is forked from $($repository.source.full_name), not $env:UPSTREAM_REPOSITORY"
+          }
+
+      # Credentials persist so the merge result can push back to the fork, and
+      # complete history keeps merge-base valid across both fetched sides.
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.repository.default_branch }}
+
+      - name: Merge upstream into the default branch
+        id: sync
+        shell: pwsh
+        env:
+          SYNC_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git remote add upstream $env:UPSTREAM_URL
+          if ($LASTEXITCODE -ne 0) { throw 'adding the upstream remote failed' }
+          git fetch --no-tags upstream HEAD
+          if ($LASTEXITCODE -ne 0) { throw 'fetching upstream HEAD failed' }
+          $upstreamSha = (git rev-parse FETCH_HEAD).Trim()
+          if ($LASTEXITCODE -ne 0) { throw 'resolving upstream HEAD failed' }
+          # The fork carries its own commits (this workflow among them), so SHA
+          # equality is not the up-to-date test: upstream must be an ancestor of
+          # the fork's branch.
+          git merge-base --is-ancestor FETCH_HEAD HEAD
+          if ($LASTEXITCODE -eq 0) {
+            $head = (git rev-parse HEAD).Trim()
+            Add-Content -Path $env:GITHUB_OUTPUT -Value 'changed=false'
+            Add-Content -Path $env:GITHUB_OUTPUT -Value "sha=$head"
+            Write-Host "Already contains upstream $upstreamSha; nothing to build."
+            exit 0
+          }
+          git merge --no-edit -m "chore: sync upstream $($upstreamSha.Substring(0, 7))" FETCH_HEAD
+          if ($LASTEXITCODE -ne 0) { throw 'merging upstream failed; resolve the conflicts in the fork and rerun' }
+          git push origin "HEAD:refs/heads/$env:SYNC_BRANCH"
+          if ($LASTEXITCODE -ne 0) { throw "pushing $env:SYNC_BRANCH failed" }
+          $merged = (git rev-parse HEAD).Trim()
+          Add-Content -Path $env:GITHUB_OUTPUT -Value 'changed=true'
+          Add-Content -Path $env:GITHUB_OUTPUT -Value "sha=$merged"
+          Write-Host "Synced $env:SYNC_BRANCH to $merged (upstream $upstreamSha)."
+
+  build-desktop:
+    name: desktop win-x64 / unsigned package
+    needs: sync
+    # Scheduled runs build only what the sync changed; a manual run always
+    # builds so the packaging path stays exercisable without new upstream work.
+    if: needs.sync.outputs.changed == 'true' || github.event_name == 'workflow_dispatch'
+    runs-on: windows-2025
+    # Packaging downloads Electron and the locked primary-runtime payload, then
+    # builds the full repository and the NSIS installer without signing.
+    timeout-minutes: 180
+    permissions:
+      # Publishing the prerelease release and its assets needs write; the sync
+      # push in the sync job holds its own write permission.
+      contents: write
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.sync.outputs.sha }}
+
+      - name: Enable Developer Mode (symlink support)
+        shell: pwsh
+        run: >-
+          reg add "HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\AppModelUnlock"
+          /t REG_DWORD /f /v "AllowDevelopmentWithoutDevLicense" /d "1"
+
+      - uses: pnpm/action-setup@v4
+        with:
+          dest: ${{ runner.temp }}/setup-pnpm-js-${{ github.run_id }}-${{ github.run_attempt }}-${{ github.job }}
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: ${{ env.PRIMARY_NODE_VERSION }}
+
+      - name: Install (immutable)
+        shell: pwsh
+        run: pnpm install --frozen-lockfile
+
+      # Packaging reads release settings from this Git-ignored file and never
+      # from ambient values; unsigned builds need the app id and the selected
+      # mandatory-update origin only.
+      - name: Write the unsigned packaging settings
+        shell: pwsh
+        run: |
+          Set-Content -Path apps/desktop/.env.windows -Encoding utf8 -Value @(
+            'DSH_DESKTOP_APP_ID=com.deepseek.harness'
+            'DSH_DESKTOP_AUTO_UPDATE_ENV=test'
+            'DSH_DESKTOP_MANDATORY_UPDATE_TEST_ORIGIN=https://harness-test.deepseek.com'
+            'DSH_DESKTOP_MANDATORY_UPDATE_PROD_ORIGIN=https://harness.deepseek.com'
+          )
+
+      # The package command runs the repository build itself: official build,
+      # packed dsh/vendor/landlock closures, prepared Electron and primary
+      # runtime, then the unsigned NSIS installer.
+      - name: Build and package the desktop client (unsigned)
+        shell: pwsh
+        run: pnpm run package:desktop:win:x64:unsigned
+
+      - name: Verify the installer artifact
+        shell: pwsh
+        run: |
+          $installer = @(
+            Get-ChildItem apps/desktop/.desktop-build/targets/win-x64/unsigned-artifacts -Filter 'deepseek-harness-*' -File |
+              Where-Object { $_.Extension -eq '.exe' }
+          )
+          if ($installer.Count -eq 0) { throw 'packaging produced no installer executable' }
+          $installer | ForEach-Object { Write-Host "installer: $($_.FullName) ($($_.Length) bytes)" }
+
+      # The artifact carries the NSIS installer and the unpacked application
+      # directory: the complete compiled desktop client. GitHub has no
+      # never-expire option for artifacts; 90 is the maximum the platform
+      # allows when the repository keeps its default retention limit, and the
+      # repository/org Settings → Actions retention value caps it further if
+      # configured lower.
+      - uses: actions/upload-artifact@v4
+        with:
+          name: deepseek-harness-desktop-win-x64-unsigned
+          path: apps/desktop/.desktop-build/targets/win-x64/unsigned-artifacts/
+          if-no-files-found: error
+          retention-days: 90
+
+      # Release assets never expire, so the installer also ships as a
+      # prerelease for the exact synced commit. The tag embeds the version and
+      # the synced commit, so a rerun of the same sync re-uploads the assets
+      # with --clobber instead of creating a duplicate release.
+      - name: Publish the installer as a prerelease
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SYNC_SHA: ${{ needs.sync.outputs.sha }}
+        run: |
+          $version = (node -p "require('./package.json').version").Trim()
+          if ($LASTEXITCODE -ne 0) { throw 'reading the repository version failed' }
+          $tag = "desktop-unsigned-v$version-g$($env:SYNC_SHA.Substring(0, 7))"
+          $installers = @(
+            Get-ChildItem apps/desktop/.desktop-build/targets/win-x64/unsigned-artifacts -Filter 'deepseek-harness-*' -File |
+              Where-Object { $_.Extension -eq '.exe' }
+          )
+          if ($installers.Count -eq 0) { throw 'packaging produced no installer executable' }
+          $assets = @($installers | ForEach-Object { $_.FullName })
+          $notes = "Unsigned Windows x64 desktop client built from synced commit $($env:SYNC_SHA). No code signing is applied."
+          $flags = @('--prerelease', '--target', $env:SYNC_SHA,
+            '--title', "DeepSeek Harness $version (unsigned win-x64)",
+            '--notes', $notes)
+          # Probe first: an existing release takes the upload path, and the
+          # probe's "not found" stderr stays in the captured output.
+          $probe = (gh release view $tag --json tagName --jq .tagName) 2>&1
+          if ($LASTEXITCODE -eq 0) {
+            gh release upload $tag @assets --clobber
+          } else {
+            gh release create $tag @assets @flags
+          }
+          if ($LASTEXITCODE -ne 0) { throw "publishing release $tag failed" }
+          Write-Host "published prerelease $tag with $($assets.Count) asset(s)"
